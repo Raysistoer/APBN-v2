@@ -1,6 +1,6 @@
 {
-  "name": "APBN v2 – Household Budget",
-  "short_name": "APBN v2",
+  "name": "APBN – Household Budget",
+  "short_name": "APBN",
   "description": "Household budget, actuals, savings goals and cashflow for the family.",
   "start_url": "./",
   "scope": "./",

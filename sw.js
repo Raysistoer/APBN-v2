@@ -1,5 +1,5 @@
 /* APBN service worker: caches the app shell so it opens fast. Data always comes live from the API. */
-const VERSION = 'apbn-v2-2';
+const VERSION = 'apbn-v2-4';
 const SHELL = ['./', './index.html', './config.js', './manifest.webmanifest', './icon-192.png', './icon-512.png',
   'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).catch(() => {})); self.skipWaiting(); });

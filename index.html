@@ -353,6 +353,9 @@ svg.chart{width:100%;height:auto;display:block}
 #apbn-lock .lk-err{color:var(--expense);font-size:13px;min-height:18px}
 #apbn-lock .lk-ok{color:var(--income);font-size:13px}
 #apbn-lock .lk-links{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+#apbn-lock .bio-btn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;padding:14px;font-size:16px}
+#apbn-lock .fp{width:26px;height:26px}
+#apbn-lock .lk-or{text-align:center;font-size:12px;opacity:.7;margin:12px 0 4px}
 </style>
 <div id="apbn-lock"><div class="lk" id="apbn-lock-card"><div class="lk-logo">Rp</div><h2>APBN</h2><p>Checking access…</p></div></div>
 <script>
@@ -362,6 +365,53 @@ svg.chart{width:100%;height:auto;display:block}
   const LS={ get:k=>{ try{ return localStorage.getItem(k); }catch(_){ return null; } }, set:(k,v)=>{ try{ v==null?localStorage.removeItem(k):localStorage.setItem(k,v); }catch(_){} } };
   let SESSION=null, DATA=null, MODE='', unlockedOnce=false, hiddenAt=0;
   let EMAIL=LS.get('apbn_email')||'', DEVICE=LS.get('apbn_device')||'';
+  let BIO=false; const AWAY_LOCK_MS=60000;   // fingerprint/face unlock on this device; lock after 1 minute in the background
+  /* ---- fingerprint / face unlock (WebAuthn passkey that stays on this device) ---- */
+  const b64u=buf=>{ const a=new Uint8Array(buf); let s=''; for(let i=0;i<a.length;i++) s+=String.fromCharCode(a[i]); return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); };
+  const unb64u=s=>{ s=String(s).replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4) s+='='; return Uint8Array.from(atob(s),c=>c.charCodeAt(0)); };
+  async function bioAvailable(){ try{ return !!(window.PublicKeyCredential && window.isSecureContext && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()); }catch(_){ return false; } }
+  function cbor(d){ let i=0;
+    const len=ai=>{ if(ai<24) return ai; if(ai===24) return d[i++]; if(ai===25){ const v=d[i]*256+d[i+1]; i+=2; return v; } if(ai===26){ const v=d[i]*16777216+d[i+1]*65536+d[i+2]*256+d[i+3]; i+=4; return v; } throw new Error('Unsupported key format'); };
+    const item=()=>{ const ib=d[i++], mt=ib>>5, ai=ib&31;
+      if(mt===0) return len(ai); if(mt===1) return -1-len(ai);
+      if(mt===2){ const n=len(ai), v=d.slice(i,i+n); i+=n; return v; }
+      if(mt===3){ const n=len(ai), v=new TextDecoder().decode(d.slice(i,i+n)); i+=n; return v; }
+      if(mt===4){ const n=len(ai), a=[]; for(let k=0;k<n;k++) a.push(item()); return a; }
+      if(mt===5){ const n=len(ai), m=new Map(); for(let k=0;k<n;k++){ const kk=item(); m.set(kk,item()); } return m; }
+      if(mt===7) return ai===21?true:ai===20?false:null;
+      throw new Error('Unsupported key format'); };
+    return item(); }
+  function deviceKey(att){ const ad=cbor(new Uint8Array(att)).get('authData'); if(!ad||!(ad[32]&0x40)) throw new Error('The device did not return a key.');
+    const L=ad[53]*256+ad[54], k=cbor(ad.slice(55+L)), alg=k.get(3);
+    if(alg===-7) return {alg,key:{x:b64u(k.get(-2)),y:b64u(k.get(-3))}};
+    if(alg===-257) return {alg,key:{n:b64u(k.get(-1)),e:b64u(k.get(-2))}};
+    throw new Error('This device key type is not supported.'); }
+  async function bioEnroll(){
+    const st=await call('bioRegStart',{session:SESSION,device:DEVICE});
+    const cred=await navigator.credentials.create({publicKey:{challenge:unb64u(st.challenge),rp:{name:'APBN',id:location.hostname},
+      user:{id:unb64u(st.userId),name:st.email,displayName:st.email},pubKeyCredParams:[{type:'public-key',alg:-7},{type:'public-key',alg:-257}],
+      authenticatorSelection:{authenticatorAttachment:'platform',userVerification:'required',residentKey:'discouraged'},attestation:'none',timeout:60000}});
+    const k=deviceKey(cred.response.attestationObject);
+    await call('bioRegFinish',{session:SESSION,device:DEVICE,credId:b64u(cred.rawId),alg:k.alg,key:k.key,clientData:b64u(cred.response.clientDataJSON)});
+    BIO=true;
+  }
+  async function bioUnlock(){
+    const st=await call('bioStart',{email:EMAIL,device:DEVICE});
+    const a=await navigator.credentials.get({publicKey:{challenge:unb64u(st.challenge),rpId:location.hostname,allowCredentials:[{type:'public-key',id:unb64u(st.id)}],userVerification:'required',timeout:60000}});
+    const r=await call('bioUnlock',{email:EMAIL,device:DEVICE,credId:b64u(a.rawId),authData:b64u(a.response.authenticatorData),clientData:b64u(a.response.clientDataJSON),signature:b64u(a.response.signature)});
+    unlocked(r.session,false);
+  }
+  let bioBusy=false;
+  async function bioTry(auto){
+    if(bioBusy||!BIO||MODE!=='unlock') return; bioBusy=true; const err=$l('lk-err'), btn=$l('lk-bio'); if(btn) btn.disabled=true;
+    try{ await bioUnlock(); }
+    catch(e){ const m=errMsg(e);
+      if(m==='DEVICE'){ BIO=false; DEVICE=''; LS.set('apbn_device',null); showLock('verify','This device was signed out. Enter the new code.'); sendCode(false); }
+      else if(/off on this device/i.test(m)){ BIO=false; showLock('unlock','Fingerprint unlock was turned off. Enter your PIN.'); }
+      else if(e&&(e.name==='NotAllowedError'||e.name==='AbortError')){ if(!auto&&err) err.textContent='Fingerprint cancelled. Try again or enter your PIN.'; }
+      else if(err) err.textContent=m; }
+    finally{ bioBusy=false; const b=$l('lk-bio'); if(b) b.disabled=false; }
+  }
   const subs=[]; const meta={fromCache:false,hasPendingWrites:false};
   const errMsg=e=>String(e&&e.message||e).replace(/^(Exception|Error):\s*/,'');
   async function call(action,payload={}){
@@ -408,7 +458,7 @@ svg.chart{width:100%;height:auto;display:block}
   const esc=s=>String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
   const pinInput=(id,label,auto)=>`<label for="${id}">${label}</label><input id="${id}" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" ${auto?'data-auto="1"':''}>`;
   const codeInput=`<label for="lk-code">6-digit code from your email</label><input id="lk-code" class="code" type="text" inputmode="numeric" maxlength="6" autocomplete="one-time-code" data-auto-code="1">`;
-  function showLock(mode,msg){
+  function showLock(mode,msg,autoBio){
     MODE=mode; const box=$l('apbn-lock'), card=$l('apbn-lock-card'); box.hidden=false;
     const head=`<div class="lk-logo">Rp</div><h2>APBN</h2>`;
     let body='';
@@ -417,12 +467,18 @@ svg.chart{width:100%;height:auto;display:block}
     else if(mode==='email') body=`<p>Sign in with your registered Gmail.</p><label for="lk-email">Email</label><input id="lk-email" type="email" inputmode="email" autocomplete="email" style="font-size:16px;letter-spacing:0;font-weight:600" value="${esc(EMAIL)}"><div class="lk-err" id="lk-err">${esc(msg||'')}</div><button class="btn primary" type="button" id="lk-go">Continue</button>`;
     else if(mode==='verify') body=`<p>New device. We sent a 6-digit code to <b>${esc(EMAIL)}</b>.</p>${codeInput}<div class="lk-err" id="lk-err">${esc(msg||'')}</div><button class="btn primary" type="button" id="lk-go">Verify</button><div class="lk-links"><button class="link" type="button" id="lk-resend">Send again</button><button class="link" type="button" id="lk-back">Change email</button></div>`;
     else if(mode==='create') body=`<p>Create your own 6-digit PIN.</p>${pinInput('lk-pin','New PIN')}${pinInput('lk-pin2','Repeat PIN')}<div class="lk-err" id="lk-err">${esc(msg||'')}</div><button class="btn primary" type="button" id="lk-go">Create PIN</button>`;
-    else if(mode==='unlock') body=`<p>${esc(msg||'Enter your PIN')}</p>${pinInput('lk-pin','PIN',true)}<div class="lk-err" id="lk-err"></div><button class="btn primary" type="button" id="lk-go">Unlock</button><div class="lk-links"><button class="link" type="button" id="lk-forgot">Forgot PIN?</button><span class="hint">${esc(EMAIL)}</span></div>`;
+    else if(mode==='unlock') body=`<p>${esc(msg||(BIO?'Unlock with your fingerprint or PIN':'Enter your PIN'))}</p>${BIO?`<button class="btn primary bio-btn" type="button" id="lk-bio"><svg class="fp" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6.5 6.2A8 8 0 0 1 20 12v1.5"/><path d="M4 12a8 8 0 0 1 1.1-4"/><path d="M8 12a4 4 0 0 1 8 0v2a10 10 0 0 1-1.2 4.8"/><path d="M12 12v2.5a12 12 0 0 1-2.2 6.9"/><path d="M4.5 16.5A13 13 0 0 0 5 13v-1"/><path d="M8.3 20.2A13 13 0 0 0 8 14v-1.5"/><path d="M19.3 17.5a17 17 0 0 0 .7-3"/></svg>Unlock with fingerprint</button><div class="lk-or">or enter your PIN</div>`:''}${pinInput('lk-pin','PIN',true)}<div class="lk-err" id="lk-err"></div><button class="btn${BIO?'':' primary'}" type="button" id="lk-go">Unlock with PIN</button><div class="lk-links"><button class="link" type="button" id="lk-forgot">Forgot PIN?</button><span class="hint">${esc(EMAIL)}</span></div>`;
     else if(mode==='forgot') body=`<p>We'll email a reset code to <b>${esc(EMAIL)}</b>.</p><button class="btn" type="button" id="lk-send">Email me a code</button><div class="lk-ok" id="lk-ok"></div>${codeInput.replace('data-auto-code="1"','')}${pinInput('lk-pin','New PIN')}${pinInput('lk-pin2','Repeat new PIN')}<div class="lk-err" id="lk-err"></div><button class="btn primary" type="button" id="lk-go">Reset PIN</button><button class="link" type="button" id="lk-back">Back</button>`;
     else if(mode==='change') body=`<p>Change your PIN</p>${pinInput('lk-old','Current PIN')}${pinInput('lk-pin','New PIN')}${pinInput('lk-pin2','Repeat new PIN')}<div class="lk-err" id="lk-err"></div><button class="btn primary" type="button" id="lk-go">Save new PIN</button><button class="link" type="button" id="lk-back">Cancel</button>`;
+    else if(mode==='bio-offer') body=`<p><svg class="fp" style="width:44px;height:44px;display:block;margin:0 auto 8px" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6.5 6.2A8 8 0 0 1 20 12v1.5"/><path d="M4 12a8 8 0 0 1 1.1-4"/><path d="M8 12a4 4 0 0 1 8 0v2a10 10 0 0 1-1.2 4.8"/><path d="M12 12v2.5a12 12 0 0 1-2.2 6.9"/><path d="M4.5 16.5A13 13 0 0 0 5 13v-1"/><path d="M8.3 20.2A13 13 0 0 0 8 14v-1.5"/><path d="M19.3 17.5a17 17 0 0 0 .7-3"/></svg>Open APBN faster next time with your <b>fingerprint</b> or face instead of typing the PIN.</p><div class="lk-err" id="lk-err"></div><button class="btn primary bio-btn" type="button" id="lk-bio-on">Turn on fingerprint unlock</button><div class="lk-links" style="justify-content:center;margin-top:10px"><button class="link" type="button" id="lk-bio-skip">Not now</button></div><p class="hint" style="font-size:12px;margin-top:10px">Your fingerprint stays on this phone. APBN only receives a signed one-time check. The PIN keeps working as backup.</p>`;
     else body=`<p>${esc(msg||'Connecting…')}</p>`;
     card.innerHTML=head+body;
-    const first=card.querySelector('input'); if(first) setTimeout(()=>first.focus(),60);
+    const first=card.querySelector('input'); if(first && !(mode==='unlock'&&BIO)) setTimeout(()=>first.focus(),60);
+    if($l('lk-bio')){ $l('lk-bio').onclick=()=>bioTry(false); if(autoBio) setTimeout(()=>bioTry(true),250); }
+    if($l('lk-bio-skip')) $l('lk-bio-skip').onclick=()=>{ LS.set('apbn_bio_ask','no'); box.hidden=true; };
+    if($l('lk-bio-on')) $l('lk-bio-on').onclick=async()=>{ const b=$l('lk-bio-on'); b.disabled=true;
+      try{ await bioEnroll(); box.hidden=true; if(window.toast) toast('Fingerprint unlock is on'); }
+      catch(e){ $l('lk-err').textContent=(e&&e.name==='NotAllowedError')?'Cancelled. You can turn it on later in Setup → Security.':errMsg(e); b.disabled=false; } };
     card.querySelectorAll('input').forEach(i=>{
       i.addEventListener('input',()=>{ if(i.inputMode==='numeric') i.value=i.value.replace(/\D/g,'').slice(0,6); if((i.dataset.auto||i.dataset.autoCode) && i.value.length===6) go(); });
       i.addEventListener('keydown',e=>{ if(e.key==='Enter') go(); }); });
@@ -442,43 +498,51 @@ svg.chart{width:100%;height:auto;display:block}
         const em=v('lk-email').trim().toLowerCase(); if(!/^\S+@\S+\.\S+$/.test(em)) return fail('Enter a valid email.');
         if(em!==EMAIL){ DEVICE=''; LS.set('apbn_device',null); }
         EMAIL=em; LS.set('apbn_email',em);
-        const st=await call('hello',{email:EMAIL,device:DEVICE});
-        if(st.known) showLock(st.hasPin?'unlock':'create');
+        const st=await call('hello',{email:EMAIL,device:DEVICE}); BIO=!!st.bio;
+        if(st.known) showLock(st.hasPin?'unlock':'create',undefined,true);
         else { DEVICE=''; LS.set('apbn_device',null); showLock('verify'); sendCode(false); }
       }
       else if(MODE==='verify'){ if(!six.test(v('lk-code'))) return fail('Enter the 6-digit code.'); const r=await call('verifyCode',{email:EMAIL,code:v('lk-code')}); DEVICE=r.device; LS.set('apbn_device',DEVICE); showLock(r.hasPin?'unlock':'create', r.hasPin?'Device verified. Enter your PIN.':''); }
-      else if(MODE==='create'){ if(!six.test(v('lk-pin'))) return fail('Use exactly 6 digits.'); if(v('lk-pin')!==v('lk-pin2')) return fail('The two PINs do not match.'); unlocked((await call('createPin',{email:EMAIL,device:DEVICE,pin:v('lk-pin')})).session); }
-      else if(MODE==='unlock'){ if(!six.test(v('lk-pin'))) return fail('Enter 6 digits.'); unlocked((await call('unlock',{email:EMAIL,device:DEVICE,pin:v('lk-pin')})).session); }
+      else if(MODE==='create'){ if(!six.test(v('lk-pin'))) return fail('Use exactly 6 digits.'); if(v('lk-pin')!==v('lk-pin2')) return fail('The two PINs do not match.'); unlocked((await call('createPin',{email:EMAIL,device:DEVICE,pin:v('lk-pin')})).session,true); }
+      else if(MODE==='unlock'){ if(!six.test(v('lk-pin'))) return fail('Enter 6 digits.'); unlocked((await call('unlock',{email:EMAIL,device:DEVICE,pin:v('lk-pin')})).session,true); }
       else if(MODE==='forgot'){ if(!six.test(v('lk-code').trim())) return fail('Enter the 6-digit code from the email.'); if(!six.test(v('lk-pin'))) return fail('New PIN must be 6 digits.'); if(v('lk-pin')!==v('lk-pin2')) return fail('The two PINs do not match.');
-        const r=await call('resetPin',{email:EMAIL,device:DEVICE,code:v('lk-code').trim(),pin:v('lk-pin')}); DEVICE=r.device; LS.set('apbn_device',DEVICE); unlocked(r.session); }
+        const r=await call('resetPin',{email:EMAIL,device:DEVICE,code:v('lk-code').trim(),pin:v('lk-pin')}); DEVICE=r.device; LS.set('apbn_device',DEVICE); unlocked(r.session,true); }
       else if(MODE==='change'){ if(!six.test(v('lk-pin'))) return fail('New PIN must be 6 digits.'); if(v('lk-pin')!==v('lk-pin2')) return fail('The two PINs do not match.'); await call('changePin',{session:SESSION,oldPin:v('lk-old'),pin:v('lk-pin')}); $l('apbn-lock').hidden=true; if(window.toast) toast('PIN changed'); }
     }catch(e){ const m=errMsg(e);
       if(m==='DEVICE'){ DEVICE=''; LS.set('apbn_device',null); showLock('verify','This device was signed out. Enter the new code.'); sendCode(false); return; }
       if(/not registered/i.test(m) && MODE==='email') return showLock('denied',m);
       fail(m); }
   }
-  function unlocked(session){
+  function unlocked(session,viaPin){
     SESSION=session; $l('apbn-lock').hidden=true;
     refresh().then(()=>{ if(!unlockedOnce){ unlockedOnce=true; resolveReady(); } }).catch(e=>showLock('denied',errMsg(e)));
+    if(viaPin && !BIO && LS.get('apbn_bio_ask')!=='no') bioAvailable().then(ok=>{ if(ok && SESSION) showLock('bio-offer'); });
   }
   window.__apbnLock=async mode=>{
-    if(mode==='lock'){ call('lock',{session:SESSION}).catch(()=>{}); SESSION=null; showLock('unlock','Locked. Enter your PIN.'); }
-    else if(mode==='signout'){ call('lock',{session:SESSION}).catch(()=>{}); SESSION=null; DEVICE=''; LS.set('apbn_device',null); showLock('email','Signed out of this device.'); }
-    else if(mode==='signoutall'){ try{ await call('signOutAll',{session:SESSION}); }catch(_){} SESSION=null; DEVICE=''; LS.set('apbn_device',null); showLock('email','All devices signed out. Sign in again on each device.'); }
+    if(mode==='lock'){ call('lock',{session:SESSION}).catch(()=>{}); SESSION=null; showLock('unlock',BIO?'Locked.':'Locked. Enter your PIN.'); }
+    else if(mode==='bio'){
+      if(BIO){ if(!confirm('Turn off fingerprint unlock on this device? You will use your PIN instead.')) return; try{ await call('bioOff',{session:SESSION,device:DEVICE}); BIO=false; if(window.toast) toast('Fingerprint unlock is off'); }catch(e){ alert(errMsg(e)); } }
+      else if(!(await bioAvailable())){ alert('This device has no fingerprint or face unlock that APBN can use. Set up a screen lock with fingerprint/face in the phone settings first.'); }
+      else { try{ await bioEnroll(); if(window.toast) toast('Fingerprint unlock is on'); }catch(e){ if(!(e&&e.name==='NotAllowedError')) alert(errMsg(e)); } }
+      if(window.render) render();
+    }
+    else if(mode==='signout'){ call('lock',{session:SESSION}).catch(()=>{}); SESSION=null; BIO=false; DEVICE=''; LS.set('apbn_device',null); showLock('email','Signed out of this device.'); }
+    else if(mode==='signoutall'){ try{ await call('signOutAll',{session:SESSION}); }catch(_){} SESSION=null; BIO=false; DEVICE=''; LS.set('apbn_device',null); showLock('email','All devices signed out. Sign in again on each device.'); }
     else showLock('change');
   };
   (async()=>{
     if(!API) return showLock('config');
     if(!EMAIL) return showLock('email');
-    try{ const st=await call('hello',{email:EMAIL,device:DEVICE}); if(st.known) showLock(st.hasPin?'unlock':'create'); else showLock('email'); }
+    try{ const st=await call('hello',{email:EMAIL,device:DEVICE}); BIO=!!st.bio; if(st.known) showLock(st.hasPin?'unlock':'create',undefined,true); else showLock('email'); }
     catch(e){ const m=errMsg(e); if(/not registered/i.test(m)) showLock('denied',m); else showLock('email',m); }
   })();
   setInterval(()=>{ if(SESSION && !document.hidden) refresh().catch(()=>{}); },30000);
   document.addEventListener('visibilitychange',()=>{
     if(document.hidden){ hiddenAt=Date.now(); return; }
-    if(SESSION && hiddenAt && Date.now()-hiddenAt>5*60000){ SESSION=null; showLock('unlock','Locked after 5 minutes away. Enter your PIN.'); return; }
+    if(SESSION && hiddenAt && Date.now()-hiddenAt>AWAY_LOCK_MS){ call('lock',{session:SESSION}).catch(()=>{}); SESSION=null; showLock('unlock',BIO?'Locked while you were away.':'Locked while you were away. Enter your PIN.',true); return; }
     if(SESSION) refresh().catch(()=>{});
   });
+  window.__apbnBioOn=()=>BIO;
   window.claude={ use: async n=>{ await ready; return ({db,user,downloads})[n]||null; } };
 })();
 /* ---- install app (PWA) ---- */
@@ -958,8 +1022,8 @@ function viewSetup(){
       <button class="btn" type="button" data-action="add-acc">+ Add account</button></div></div>
     <div class="actions"><span class="hint">${dirty?'You have unsaved changes.':''}</span><button class="btn primary" type="button" data-action="save-setup" ${dirty&&S.canWrite?'':'disabled'}>Save setup</button></div>
     <div class="grid two">${catEd('expenseCats','Expense categories & items')}<div class="grid" style="gap:14px;align-content:start">${catEd('incomeCats','Income categories & items')}
-      <div class="card"><div class="card-h"><h2>🔒 Security</h2></div><p class="hint" style="margin:0 0 12px">Sign-in: registered email → code on each new device → your private 6-digit PIN. The app locks on every open and after 5 minutes in the background.</p>
-        <div class="actions" style="justify-content:flex-start"><button class="btn" type="button" onclick="window.__apbnLock&&window.__apbnLock('change')">Change PIN</button><button class="btn" type="button" onclick="window.__apbnLock&&window.__apbnLock('lock')">Lock now</button><button class="btn" type="button" onclick="window.__apbnLock&&window.__apbnLock('signout')">Sign out this device</button><button class="btn danger" type="button" onclick="window.__apbnLock&&window.__apbnLock('signoutall')">Sign out all my devices</button></div></div>
+      <div class="card"><div class="card-h"><h2>🔒 Security</h2></div><p class="hint" style="margin:0 0 12px">Sign-in: registered email → code on each new device → your private 6-digit PIN. The app locks on every open and after 1 minute in the background. Fingerprint/face unlock: <b>${window.__apbnBioOn&&window.__apbnBioOn()?'On':'Off'}</b> on this device.</p>
+        <div class="actions" style="justify-content:flex-start"><button class="btn" type="button" onclick="window.__apbnLock&&window.__apbnLock('bio')">${window.__apbnBioOn&&window.__apbnBioOn()?'Turn off fingerprint unlock':'Turn on fingerprint unlock'}</button><button class="btn" type="button" onclick="window.__apbnLock&&window.__apbnLock('change')">Change PIN</button><button class="btn" type="button" onclick="window.__apbnLock&&window.__apbnLock('lock')">Lock now</button><button class="btn" type="button" onclick="window.__apbnLock&&window.__apbnLock('signout')">Sign out this device</button><button class="btn danger" type="button" onclick="window.__apbnLock&&window.__apbnLock('signoutall')">Sign out all my devices</button></div></div>
       <div class="card"><div class="card-h"><h2>📲 Install app</h2></div><p class="hint" style="margin:0 0 12px">Android/Chrome: tap Install below or menu ⋮ → Install app. iPhone/iPad: Safari → Share → Add to Home Screen.</p><button class="btn primary" type="button" onclick="(async()=>{const p=window.__apbnInstall; if(!p){toast('Use the browser menu: Install app / Add to Home Screen');return;} p.prompt(); await p.userChoice; window.__apbnInstall=null;})()">Install APBN</button></div>
       <div class="card"><div class="card-h"><h2>Export to Excel</h2></div><p class="hint" style="margin:0 0 12px">All data already lives in your Google Sheet (tabs Entries, Budget, Master, Accounts, Goals). <a class="link" href="${esc(window.__SHEET_URL||'#')}" target="_blank" rel="noopener">Open the Google Sheet ↗</a><br>The Excel export below is still available for Household_Budget_Analysis.xlsx.</p>
         <button class="btn primary" type="button" data-action="export" ${S.downloads?'':'disabled'}>Download Excel export</button></div>
